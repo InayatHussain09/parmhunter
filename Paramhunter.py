@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ParmHunter 2.1 — autonomous parameter discovery & triage engine
+ParmHunter 2.3.0 — autonomous parameter discovery & triage engine
 
 Pipeline:
-  1. Harvest param names autonomously (archives, live crawl, JS, sitemap,
-     OpenAPI, GraphQL) + built-in dictionary + your -w files.
+  1. Harvest param names concurrently (archives, katana, waybackurls, gau,
+     live crawl, JS, sitemap, OpenAPI, GraphQL) + built-in dictionary + -w.
+     Every source is timeboxed so a slow archive can never stall the run.
   2. Rank by heuristics and a local SQLite hit-rate model.
-  3. Baseline-first differential probing with token-Jaccard change scoring,
-     soft-404 awareness and per-class detectors.
-  4. Keep only pairs that produce a signal, banded by severity.
+  3. Baseline-first differential probing with per-base caching, token-Jaccard
+     change scoring, soft-404 awareness and per-class detectors.
+  4. Emit per-class parameter lists and per-class findings, banded by severity.
 
 Author : Inayat Hussain ( Security Researcher )
 """
@@ -22,10 +23,15 @@ import csv
 import hashlib
 import html
 import json
+import logging
+import os
 import random
 import re
+import shutil
+import socket
 import sqlite3
 import string
+import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
@@ -35,15 +41,19 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
+logging.getLogger("aiohttp").setLevel(logging.CRITICAL)
+
 try:
     import aiohttp
+    from aiohttp import abc as aiohttp_abc
     HAVE_AIOHTTP = True
 except ImportError:
     HAVE_AIOHTTP = False
 
-VERSION = "2.1"
+VERSION = "2.3.0"
 MAX_BODY = 400_000
 SOFT_404_SIM = 0.92
+DNS_TTL = 300
 
 SEVERITY = {
     "rce": "critical", "sqli": "high", "lfi": "high", "ssrf": "high",
@@ -51,7 +61,15 @@ SEVERITY = {
     "crlf": "medium", "idor": "medium", "debug-flag": "low", "error": "low",
 }
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-ALL_CLASSES = ["sql", "redirect", "lfi", "rce", "ssrf", "ssti", "xss", "crlf", "object", "debug"]
+
+GO_TOOLS = {
+    "katana": "github.com/projectdiscovery/katana/cmd/katana@latest",
+    "waybackurls": "github.com/tomnomnom/waybackurls@latest",
+    "gau": "github.com/lc/gau/v2/cmd/gau@latest",
+}
+
+BUCKET_CLASSES = ["xss", "sqli", "lfi", "rce", "ssrf", "ssti",
+                  "open-redirect", "crlf", "idor", "debug-flag"]
 
 
 # ───────────────────────────── console ──────────────────────────────
@@ -110,12 +128,14 @@ def _wordmark() -> list:
 
 def banner(cfg):
     G = "\033[1;32m"; CY = "\033[1;36m"; Y = "\033[1;33m"; D = "\033[2m"; X = "\033[0m"
-    rule = "─" * 76
+    art = _wordmark()
+    rule = "─" * max(len(r) for r in art)
     mode = "passive-only" if cfg.passive_only else "active-only" if cfg.active_only else "full"
     targets = len(cfg.urls) + (1 if cfg.domain else 0)
+    tools = ",".join(t for t in GO_TOOLS if tool_path(t)) or "none"
 
     print()
-    for row in _wordmark():
+    for row in art:
         print(f"  {G}{row}{X}")
     print(f"  {D}{rule}{X}")
     print(f"  {G}ParmHunter v{VERSION}{X} {D}· autonomous parameter discovery & triage{X}")
@@ -126,8 +146,67 @@ def banner(cfg):
     print(f"  {D}targets{X} {targets}   {D}wordlists{X} {len(cfg.wordlists)}   "
           f"{D}learn-db{X} {'off' if cfg.no_learn else 'on'}   "
           f"{D}cache{X} {'on' if cfg.cache else 'off'}")
+    print(f"  {D}resolver{X} {'aiodns' if cfg.aiodns else 'cached-threaded'}"
+          f"{'  ipv4' if cfg.ipv4 else ''}   {D}external{X} {tools}")
     print(f"  {Y}authorized testing only — know your scope{X}")
     print()
+
+
+# ─────────────────────────── tool bootstrap ─────────────────────────
+
+_BIN_DIRS = []
+
+
+def go_bin_dir():
+    if _BIN_DIRS:
+        return _BIN_DIRS[0]
+    cands = []
+    if os.environ.get("GOBIN"):
+        cands.append(os.environ["GOBIN"])
+    if os.environ.get("GOPATH"):
+        cands.append(os.path.join(os.environ["GOPATH"], "bin"))
+    cands.append(os.path.expanduser("~/go/bin"))
+    cands.append("/usr/local/bin")
+    for d in cands:
+        if d and os.path.isdir(d) and d not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + d
+    _BIN_DIRS.extend(cands)
+    return cands[0]
+
+
+def tool_path(name):
+    go_bin_dir()
+    return shutil.which(name)
+
+
+def ensure_tools(cfg):
+    """Best-effort go install of missing recon binaries."""
+    if not cfg.install_tools:
+        return
+    missing = [t for t in GO_TOOLS if not tool_path(t)]
+    if not missing:
+        return
+    if not shutil.which("go"):
+        C.warn(f"missing {', '.join(missing)} — install Go to auto-fetch")
+        return
+    dest = go_bin_dir()
+    for name in missing:
+        C.info(f"installing {name}")
+        try:
+            subprocess.run(
+                ["go", "install", GO_TOOLS[name]],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=240, check=False,
+                env={**os.environ, "GOBIN": dest},
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    got = [t for t in GO_TOOLS if tool_path(t)]
+    if got:
+        C.ok(f"available: {', '.join(got)}")
+    still = [t for t in GO_TOOLS if not tool_path(t)]
+    if still:
+        C.warn(f"still missing: {', '.join(still)}")
 
 
 # ────────────────────────────── parameters ──────────────────────────
@@ -217,7 +296,8 @@ class Finding:
     ts: str = ""
 
     def line(self):
-        return f"{self.severity.upper():<8} {self.confidence:>3}%  {self.url}  <- {self.param}  | {self.evidence}"
+        return (f"{self.severity.upper():<8} {self.confidence:>3}%  "
+                f"{self.url}  <- {self.param}  | {self.evidence}")
 
 
 @dataclass
@@ -240,9 +320,17 @@ class Config:
     wordlist_dir: str = ""
     only_wordlist: bool = False
     threads: int = 40
-    timeout: float = 12.0
-    retries: int = 1
+    limit_per_host: int = 8
+    aiodns: bool = False
+    ipv4: bool = False
+    dns_ttl: int = DNS_TTL
+    sleep_probe: float = 4.0
+    timeout: float = 15.0
+    archive_timeout: float = 25.0
+    passive_timeout: float = 90.0
+    retries: int = 2
     rate: float = 0.0
+    max_time: float = 0.0
     proxy: str = ""
     headers: dict = field(default_factory=dict)
     cookie: str = ""
@@ -264,6 +352,10 @@ class Config:
     passive_only: bool = False
     active_only: bool = False
     params_only: bool = False
+    external: bool = True
+    install_tools: bool = True
+    katana_depth: int = 3
+    tool_timeout: float = 180.0
     collab: str = ""
     db: str = "parmhunter.kb.sqlite"
     min_confidence: int = 55
@@ -283,37 +375,90 @@ class Config:
 
 
 UA_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 
 
-def base_headers(cfg: Config) -> dict:
+def base_headers(cfg: Config, url: str = "") -> dict:
     h = {
         "User-Agent": cfg.user_agent or random.choice(UA_POOL),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "close",
+        "Accept-Encoding": "gzip, deflate",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Connection": "keep-alive",
     }
+    if url:
+        p = urlsplit(url)
+        h["Referer"] = f"{p.scheme}://{p.netloc}/"
     if cfg.cookie:
         h["Cookie"] = cfg.cookie
     h.update(cfg.headers)
     return h
 
 
+# ────────────────────────────── resolver ────────────────────────────
+
+if HAVE_AIOHTTP:
+    class CachedResolver(aiohttp_abc.AbstractResolver):
+        """Memoising resolver with a hard concurrency cap.
+
+        Stops the gaierror storm from dozens of workers hitting the system
+        resolver at once, and collapses repeat lookups into one.
+        """
+
+        def __init__(self, ttl=DNS_TTL, ipv4=False):
+            self._inner = aiohttp.ThreadedResolver()
+            self._cache = {}
+            self._lock = asyncio.Lock()
+            self._sem = asyncio.Semaphore(12)
+            self._ttl = ttl
+            self._family = socket.AF_INET if ipv4 else socket.AF_UNSPEC
+
+        async def resolve(self, host, port=0, family=socket.AF_INET):
+            key = (host, port)
+            hit = self._cache.get(key)
+            if hit and time.monotonic() - hit[0] < self._ttl:
+                return hit[1]
+            async with self._lock:
+                hit = self._cache.get(key)
+                if hit and time.monotonic() - hit[0] < self._ttl:
+                    return hit[1]
+                async with self._sem:
+                    res = await self._inner.resolve(host, port, self._family)
+                self._cache[key] = (time.monotonic(), res)
+                return res
+
+        async def close(self):
+            await self._inner.close()
+else:
+    CachedResolver = None
+
+
 # ─────────────────────────────── http ───────────────────────────────
+
+DNS_HINTS = ("gaierror", "name resolution", "Temporary failure", "getaddrinfo", "Cannot connect")
+
 
 class Fetcher:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.sem = asyncio.Semaphore(max(1, cfg.threads))
         self.session = None
+        self.resolver = None
         self._gate = asyncio.Lock()
         self._next = 0.0
         self.cache = {}
+        self.inflight = {}
         self.cache_path = Path(cfg.outdir) / "http.cache.jsonl"
+        self.errors = 0
+        self.ok = 0
 
     async def start(self):
         if self.cfg.cache and self.cache_path.exists():
@@ -324,17 +469,37 @@ class Fetcher:
                 except Exception:  # noqa: BLE001
                     continue
         if HAVE_AIOHTTP:
-            conn = aiohttp.TCPConnector(limit=self.cfg.threads,
-                                        ssl=False if self.cfg.insecure else None)
+            self.resolver = None
+            if self.cfg.aiodns:
+                try:
+                    self.resolver = aiohttp.AsyncResolver()
+                except Exception:  # noqa: BLE001
+                    self.resolver = None
+            if self.resolver is None:
+                self.resolver = CachedResolver(ttl=self.cfg.dns_ttl, ipv4=self.cfg.ipv4)
+            conn = aiohttp.TCPConnector(
+                limit=self.cfg.threads,
+                limit_per_host=self.cfg.limit_per_host,
+                ttl_dns_cache=self.cfg.dns_ttl,
+                resolver=self.resolver,
+                ssl=False if self.cfg.insecure else None,
+                enable_cleanup_closed=True,
+            )
             self.session = aiohttp.ClientSession(
                 connector=conn,
-                timeout=aiohttp.ClientTimeout(total=self.cfg.timeout),
+                timeout=aiohttp.ClientTimeout(total=self.cfg.timeout,
+                                              connect=min(8.0, self.cfg.timeout)),
                 headers=base_headers(self.cfg),
             )
 
     async def close(self):
         if self.session:
             await self.session.close()
+        if self.resolver and not isinstance(self.resolver, aiohttp.AsyncResolver):
+            try:
+                await self.resolver.close()
+            except Exception:  # noqa: BLE001
+                pass
         if self.cfg.cache:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             with self.cache_path.open("w") as fh:
@@ -352,40 +517,65 @@ class Fetcher:
         if wait:
             await asyncio.sleep(wait)
 
-    async def fetch(self, url, method="GET", data=None, extra_headers=None) -> Resp:
+    async def fetch(self, url, method="GET", data=None, extra_headers=None,
+                    timeout=None) -> Resp:
         key = hashlib.sha1(f"{method}|{url}|{data or ''}".encode()).hexdigest()
         if self.cfg.cache and key in self.cache:
             return self.cache[key]
+        if key in self.inflight:
+            return await self.inflight[key]
 
+        fut = asyncio.ensure_future(self._fetch(key, url, method, data,
+                                                extra_headers, timeout))
+        self.inflight[key] = fut
+        try:
+            return await fut
+        finally:
+            self.inflight.pop(key, None)
+
+    async def _fetch(self, key, url, method, data, extra_headers, timeout):
         async with self.sem:
             await self._throttle()
             await asyncio.sleep(random.uniform(0, 0.03))
             resp = Resp(error="unreachable")
-            for attempt in range(self.cfg.retries + 1):
+            tries = self.cfg.retries + 1
+            for attempt in range(tries):
                 t0 = time.monotonic()
                 try:
                     if HAVE_AIOHTTP:
-                        resp = await self._aio(url, method, data, extra_headers, t0)
+                        resp = await self._aio(url, method, data, extra_headers, t0, timeout)
                     else:
                         resp = await asyncio.to_thread(self._sync, url, method, data,
                                                        extra_headers, t0)
+                    if resp.status in (429, 502, 503, 504) and attempt < tries - 1:
+                        await asyncio.sleep(0.8 * (attempt + 1) + random.uniform(0, 0.5))
+                        continue
                     break
                 except Exception as e:  # noqa: BLE001
-                    resp = Resp(error=f"{type(e).__name__}: {e}",
-                                elapsed=time.monotonic() - t0)
-                    if attempt >= self.cfg.retries:
+                    msg = f"{type(e).__name__}: {e}"
+                    resp = Resp(error=msg, elapsed=time.monotonic() - t0)
+                    if attempt >= tries - 1:
                         break
-                    await asyncio.sleep(0.4 * (attempt + 1))
+                    delay = 1.2 * (attempt + 1)
+                    if any(h in msg for h in DNS_HINTS):
+                        delay += 1.5
+                    await asyncio.sleep(delay + random.uniform(0, 0.4))
+        if resp.error:
+            self.errors += 1
+        else:
+            self.ok += 1
         if self.cfg.cache and not resp.error:
             self.cache[key] = resp
         return resp
 
-    async def _aio(self, url, method, data, hdrs, t0):
+    async def _aio(self, url, method, data, hdrs, t0, timeout):
         h = dict(hdrs or {})
         if data and "Content-Type" not in h:
             h["Content-Type"] = "application/x-www-form-urlencoded"
+        total = timeout or self.cfg.timeout
+        tm = aiohttp.ClientTimeout(total=total, connect=min(8.0, total))
         async with self.session.request(method, url, data=data, headers=h,
-                                        allow_redirects=False,
+                                        allow_redirects=False, timeout=tm,
                                         proxy=self.cfg.proxy or None) as r:
             raw = await r.content.read(self.cfg.max_size)
             try:
@@ -397,7 +587,7 @@ class Fetcher:
 
     def _sync(self, url, method, data, hdrs, t0):
         req = Request(url, data=data.encode() if isinstance(data, str) else data,
-                      method=method, headers={**base_headers(self.cfg), **(hdrs or {})})
+                      method=method, headers={**base_headers(self.cfg, url), **(hdrs or {})})
         ctx = None
         if self.cfg.insecure:
             import ssl
@@ -464,7 +654,6 @@ class Knowledge:
 # ──────────────────────────── url utils ─────────────────────────────
 
 def build_request(base, param, value, cfg):
-    """Return (url, body) honouring GET / POST / JSON mode."""
     if cfg.method == "GET":
         p = urlsplit(base)
         q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k != param]
@@ -491,12 +680,15 @@ def host_of(url):
         return ""
 
 
+def apex(host):
+    return host[4:] if host.startswith("www.") else host
+
+
 def _tokens(body):
     return set(re.findall(r"[A-Za-z0-9_\-]{3,}", body.lower()))
 
 
 def change(a: str, b: str) -> float:
-    """0.0 identical → 1.0 completely different, via token Jaccard."""
     A, B = _tokens(a), _tokens(b)
     if not A and not B:
         return 0.0
@@ -532,36 +724,92 @@ def urljoin_safe(base, rel):
         return ""
 
 
+def param_of(url):
+    return {k for k, _ in parse_qsl(urlsplit(url).query, keep_blank_values=True) if k}
+
+
+def sample_value(param):
+    cls = set(classify(param))
+    if cls & {"ssrf", "redirect"}:
+        return "https://example.com"
+    if "lfi" in cls:
+        return "../../etc/passwd"
+    if "rce" in cls:
+        return ";id"
+    if "ssti" in cls:
+        return "{{7*7}}"
+    if "sql" in cls:
+        return "1'"
+    return "FUZZ"
+
+
+def bucket_of(param):
+    cls = set(classify(param))
+    for b in BUCKET_CLASSES:
+        key = "redirect" if b == "open-redirect" else b
+        if key in cls:
+            return b
+    return "other"
+
+
 # ───────────────────────── passive harvest ──────────────────────────
 
+ARCHIVE_UA = "Mozilla/5.0 (compatible; ParmHunter/2.3; +https://github.com/)"
+CDX = "https://web.archive.org/cdx/search/cdx"
+
+
 class Passive:
-    def __init__(self, f):
+    """Archive/API harvesting. Every source is timeboxed and independent."""
+
+    def __init__(self, f, cfg):
         self.f = f
+        self.cfg = cfg
+
+    async def _cdx(self, host, page, limit=600):
+        # filter=original:.*=.* pushes parameter filtering server-side, which is
+        # far cheaper than the statuscode filter on large domains.
+        url = (f"{CDX}?url={host}/*&output=json&fl=original&collapse=urlkey"
+               f"&limit={limit}&page={page}&filter=original:.*=.*")
+        return await self.f.fetch(url, extra_headers={"User-Agent": ARCHIVE_UA},
+                                  timeout=self.cfg.archive_timeout)
 
     async def wayback(self, host):
         out = set()
-        r = await self.f.fetch(f"http://web.archive.org/cdx/search/cdx?url={host}/*"
-                               "&output=text&fl=original&collapse=urlkey&limit=8000"
-                               "&filter=statuscode:200")
-        if r.error:
-            return out
-        return {l.strip() for l in r.body.splitlines() if "=" in l and l.startswith("http")}
+        for h in dict.fromkeys([apex(host), host]):
+            for page in range(2):
+                r = await self._cdx(h, page)
+                if r.error or r.status != 200:
+                    break
+                try:
+                    rows = json.loads(r.body)
+                except Exception:  # noqa: BLE001
+                    break
+                if not rows:
+                    break
+                for row in rows:
+                    u = row[0] if isinstance(row, list) and row else ""
+                    if "=" in u:
+                        out.add(u)
+                if len(rows) < 600:
+                    break
+        return out
 
     async def commoncrawl(self, host):
         out = set()
-        idx = await self.f.fetch("https://index.commoncrawl.org/collinfo.json")
-        if idx.error:
+        idx = await self.f.fetch("https://index.commoncrawl.org/collinfo.json",
+                                 extra_headers={"User-Agent": ARCHIVE_UA},
+                                 timeout=self.cfg.archive_timeout)
+        if idx.error or idx.status != 200:
             return out
         try:
-            colls = json.loads(idx.body)[:2]
+            apis = [c["cdx-api"] for c in json.loads(idx.body)[:2] if c.get("cdx-api")]
         except Exception:  # noqa: BLE001
             return out
-        for c in colls:
-            api = c.get("cdx-api")
-            if not api:
-                continue
-            r = await self.f.fetch(f"{api}?url={host}/*&output=json&limit=3000")
-            if r.error:
+        for api in apis:
+            r = await self.f.fetch(f"{api}?url={apex(host)}/*&output=json&limit=1500",
+                                   extra_headers={"User-Agent": ARCHIVE_UA},
+                                   timeout=self.cfg.archive_timeout)
+            if r.error or r.status != 200:
                 continue
             for line in r.body.splitlines():
                 try:
@@ -574,27 +822,76 @@ class Passive:
 
     async def urlscan(self, host):
         out = set()
-        r = await self.f.fetch(f"https://urlscan.io/api/v1/search/?q=domain:{host}&size=200")
-        if r.error:
+        r = await self.f.fetch(f"https://urlscan.io/api/v1/search/?q=domain:{apex(host)}&size=200",
+                               timeout=self.cfg.archive_timeout)
+        if r.error or r.status != 200:
             return out
         try:
             data = json.loads(r.body)
         except Exception:  # noqa: BLE001
             return out
-        return {x.get("page", {}).get("url", "") for x in data.get("results", [])
-                if "=" in x.get("page", {}).get("url", "")}
+        for res in data.get("results", []):
+            u = res.get("page", {}).get("url", "")
+            if "=" in u:
+                out.add(u)
+        return out
 
     async def otx(self, host):
         out = set()
-        r = await self.f.fetch(f"https://otx.alienvault.com/api/v1/indicators/hostname/"
-                               f"{host}/url_list?limit=500")
-        if r.error:
-            return out
-        try:
-            data = json.loads(r.body)
-        except Exception:  # noqa: BLE001
-            return out
-        return {e.get("url", "") for e in data.get("url_list", []) if "=" in e.get("url", "")}
+        for page in (1, 2):
+            r = await self.f.fetch(
+                f"https://otx.alienvault.com/api/v1/indicators/hostname/"
+                f"{apex(host)}/url_list?limit=500&page={page}",
+                timeout=self.cfg.archive_timeout)
+            if r.error or r.status != 200:
+                break
+            try:
+                data = json.loads(r.body)
+            except Exception:  # noqa: BLE001
+                break
+            batch = data.get("url_list", [])
+            if not batch:
+                break
+            out |= {e.get("url", "") for e in batch if "=" in e.get("url", "")}
+        return out
+
+
+# ─────────────────────────── external tools ─────────────────────────
+
+async def run_tool(cmd, timeout):
+    if not tool_path(cmd[0]):
+        return set()
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return {l.strip() for l in out.decode("utf-8", "replace").splitlines() if l.strip()}
+    except (asyncio.TimeoutError, OSError):
+        if proc:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        return set()
+
+
+class External:
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    async def katana(self, seed):
+        return await run_tool([
+            "katana", "-u", seed, "-d", str(self.cfg.katana_depth),
+            "-jc", "-kf", "all", "-silent", "-duc", "-fs", "rdn",
+            "-c", str(min(self.cfg.threads, 20)),
+        ], self.cfg.tool_timeout)
+
+    async def waybackurls(self, host):
+        return await run_tool(["waybackurls", host], self.cfg.tool_timeout)
+
+    async def gau(self, host):
+        return await run_tool(["gau", "--subs", "--threads", "5", host], self.cfg.tool_timeout)
 
 
 # ──────────────────────────── crawling ──────────────────────────────
@@ -627,7 +924,17 @@ class Crawler:
     def _in_scope(self, url, host):
         if self.cfg.scope_regex:
             return re.search(self.cfg.scope_regex, url) is not None
-        return host_of(url).endswith(host)
+        return host_of(url).endswith(apex(host))
+
+    async def _get(self, url):
+        r = await self.f.fetch(url)
+        if r.status in (403, 429) or r.error:
+            r = await self.f.fetch(url, extra_headers={
+                "User-Agent": random.choice(UA_POOL),
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                "Sec-Fetch-Site": "same-origin",
+            })
+        return r
 
     async def crawl(self, seed):
         host = host_of(seed)
@@ -641,7 +948,7 @@ class Crawler:
             seen.add(url)
             if self.cfg.exclude_ext and Path(urlsplit(url).path).suffix.lower() in EXCLUDE_EXT:
                 continue
-            r = await self.f.fetch(url)
+            r = await self._get(url)
             if r.error or r.status >= 400:
                 continue
             ctype = r.headers.get("content-type", "")
@@ -662,7 +969,7 @@ class Crawler:
         for s in list(scripts)[:40]:
             if not s:
                 continue
-            r = await self.f.fetch(s)
+            r = await self._get(s)
             if not r.error and r.status == 200:
                 params |= self._harvest(r.body)
 
@@ -704,6 +1011,9 @@ class Prober:
         self.cfg = cfg
         self.kb = kb
         self.record = True
+        self._baseline = {}
+        self._soft = {}
+        self._bl_lock = asyncio.Lock()
 
     def classes(self, param):
         found = set(classify(param))
@@ -712,6 +1022,25 @@ class Prober:
         if self.cfg.skip_classes:
             found -= set(self.cfg.skip_classes)
         return found
+
+    async def _base_state(self, base):
+        """Baseline + soft-404 flag, computed once per base URL / host."""
+        if base in self._baseline:
+            return self._baseline[base], self._soft.get(base, False)
+        async with self._bl_lock:
+            if base in self._baseline:
+                return self._baseline[base], self._soft.get(base, False)
+            baseline = await self.f.fetch(base)
+            host = host_of(base)
+            if host in self._soft:
+                soft = self._soft[host]
+            else:
+                rnd = await self.f.fetch(urljoin_safe(base, f"/{token(10)}"))
+                soft = (not rnd.error and rnd.status < 400
+                        and similarity(baseline.body, rnd.body) > SOFT_404_SIM)
+                self._soft[host] = soft
+            self._baseline[base] = baseline
+            return baseline, soft
 
     async def _send(self, base, param, value):
         url, body = build_request(base, param, value, self.cfg)
@@ -722,14 +1051,9 @@ class Prober:
     async def probe(self, base, param):
         out = []
         cls = self.classes(param)
-        baseline = await self.f.fetch(base)
+        baseline, soft = await self._base_state(base)
         if baseline.error:
             return out
-
-        soft = False
-        rnd = await self.f.fetch(urljoin_safe(base, f"/{token(10)}"))
-        if not rnd.error and rnd.status < 400 and similarity(baseline.body, rnd.body) > SOFT_404_SIM:
-            soft = True
         thresh = 0.40 if soft else 0.25
 
         t = token(8)
@@ -810,7 +1134,7 @@ class Prober:
         if not a.error and not b.error and a.status == b.status:
             if change(a.body, b.body) > 0.15:
                 out.append(("sqli", 45, "boolean differential"))
-        _, s = await self._send(base, param, "1' AND SLEEP({})-- -".format(int(self.cfg.sleep_probe if hasattr(self.cfg, "sleep_probe") else 4)))
+        _, s = await self._send(base, param, f"1' AND SLEEP({int(self.cfg.sleep_probe)})-- -")
         if not s.error and s.elapsed - baseline.elapsed > 3:
             out.append(("sqli", 50, f"time delay {s.elapsed:.1f}s"))
         return out
@@ -844,7 +1168,7 @@ class Prober:
             _, r = await self._send(base, param, p)
             if not r.error and RCE_SIG.search(r.body):
                 return [("rce", 80, f"command output via {p}")]
-        _, s = await self._send(base, param, ";sleep 4")
+        _, s = await self._send(base, param, f";sleep {int(self.cfg.sleep_probe)}")
         if not s.error and s.elapsed - baseline.elapsed > 3:
             return [("rce", 50, f"blind time delay {s.elapsed:.1f}s")]
         return []
@@ -904,17 +1228,20 @@ class Hunter:
         self.cfg = cfg
         self.f = Fetcher(cfg)
         self.kb = Knowledge(cfg.db, enabled=not cfg.no_learn)
-        self.passive = Passive(self.f)
+        self.passive = Passive(self.f, cfg)
         self.crawler = Crawler(self.f, cfg)
+        self.external = External(cfg)
         self.prober = Prober(self.f, cfg, self.kb)
         self.findings = []
         self.candidates = defaultdict(set)
         self.bases = {}
+        self.hosts = []
         self.seen = set()
         self.counter = Counter()
         self.started = time.time()
-        self.outdir = Path(cfg.outdir) / "global"
-        self.state_path = Path(cfg.outdir) / "state.json"
+        self.outroot = Path(cfg.outdir)
+        self.outdir = self.outroot / "global"
+        self.state_path = self.outroot / "state.json"
 
     def targets(self):
         urls = list(self.cfg.urls)
@@ -941,8 +1268,7 @@ class Hunter:
         words += list(self.cfg.seeds)
         files = list(self.cfg.wordlists)
         if self.cfg.wordlist_dir:
-            files += [str(p) for p in sorted(Path(self.cfg.wordlist_dir).glob("*"))
-                      if p.is_file()]
+            files += [str(p) for p in sorted(Path(self.cfg.wordlist_dir).glob("*")) if p.is_file()]
         for f in files:
             p = Path(f)
             if not p.exists():
@@ -952,40 +1278,71 @@ class Hunter:
                       if l.strip() and not l.startswith("#")]
         return list(dict.fromkeys(words))
 
+    def _absorb(self, urls, host):
+        added = 0
+        for u in urls:
+            if not u or "=" not in u:
+                continue
+            if not host_of(u).endswith(apex(host)):
+                continue
+            base = norm_base(u)
+            self.bases[base] = host
+            for k in param_of(u):
+                if k not in self.candidates[base]:
+                    self.candidates[base].add(k)
+                    added += 1
+        return added
+
+    async def _source(self, name, coro, host):
+        t0 = time.time()
+        try:
+            res = await asyncio.wait_for(coro, timeout=self.cfg.passive_timeout)
+        except asyncio.TimeoutError:
+            C.dim(f"{name}: timed out")
+            return
+        except Exception as e:  # noqa: BLE001
+            C.dim(f"{name}: {type(e).__name__}")
+            return
+        n = self._absorb(res, host)
+        C.dim(f"{name}: {len(res)} urls / {n} params  ({time.time()-t0:.1f}s)")
+
     async def harvest(self, target):
         host = host_of(target)
+        if host in self.hosts:
+            return
+        self.hosts.append(host)
         C.info(f"harvesting {host}")
-        collected = set()
 
+        jobs = []
         if not self.cfg.active_only:
-            for name, fn in (("wayback", self.passive.wayback),
-                             ("commoncrawl", self.passive.commoncrawl),
-                             ("urlscan", self.passive.urlscan),
-                             ("otx", self.passive.otx)):
-                try:
-                    res = await fn(host)
-                except Exception:  # noqa: BLE001
-                    res = set()
-                C.dim(f"{name}: {len(res)}")
-                collected |= res
+            for name, coro in (("wayback", self.passive.wayback(host)),
+                               ("commoncrawl", self.passive.commoncrawl(host)),
+                               ("urlscan", self.passive.urlscan(host)),
+                               ("otx", self.passive.otx(host))):
+                jobs.append(self._source(name, coro, host))
+            if self.cfg.external:
+                jobs.append(self._source("waybackurls", self.external.waybackurls(host), host))
+                jobs.append(self._source("gau", self.external.gau(host), host))
+
+        if not self.cfg.passive_only:
+            if self.cfg.external and tool_path("katana"):
+                jobs.append(self._source("katana", self.external.katana(target), host))
+
+        # all sources race in parallel; none can block the others
+        if jobs:
+            await asyncio.gather(*jobs)
 
         if not self.cfg.passive_only:
             params, links = await self.crawler.crawl(target)
             C.dim(f"crawl: {len(params)} params / {len(links)} links")
-            for b in {norm_base(l) for l in links}:
-                self.bases[b] = host
             for p in params:
                 self.candidates[norm_base(target)].add(p)
-            collected |= {l for l in links if "=" in l}
+            self.bases[norm_base(target)] = host
+            self._absorb(links, host)
 
-        for u in collected:
-            if not host_of(u).endswith(host):
-                continue
-            base = norm_base(u)
-            self.bases[base] = host
-            for k, _ in parse_qsl(urlsplit(u).query, keep_blank_values=True):
-                if k:
-                    self.candidates[base].add(k)
+        if not self.bases:
+            C.warn(f"{host}: nothing reachable — check connectivity/DNS")
+            return
 
         if self.cfg.waf_detect:
             r = await self.f.fetch(target)
@@ -1000,7 +1357,7 @@ class Hunter:
         words = sorted(self.dictionary(), key=lambda w: -score_param(w, self.kb))
         plan = []
         for base in self.bases:
-            existing = {k for k, _ in parse_qsl(urlsplit(base).query, keep_blank_values=True)}
+            existing = param_of(base)
             cands = sorted(self.candidates.get(base, set()) | set(words),
                            key=lambda w: -score_param(w, self.kb))
             n = 0
@@ -1011,6 +1368,8 @@ class Hunter:
                 n += 1
                 if n >= self.cfg.max_params:
                     break
+        # highest-value pairs first so early output is already useful
+        plan.sort(key=lambda bp: -score_param(bp[1], self.kb))
         return plan
 
     async def run_plan(self, plan):
@@ -1063,62 +1422,94 @@ class Hunter:
         self.findings = kept
 
     # -- output ------------------------------------------------------
+    def _bucket_dirs(self, host):
+        root = self.outroot / host
+        for sub in ("params", "findings"):
+            (root / sub).mkdir(parents=True, exist_ok=True)
+        return root
+
+    def write_params(self, plan):
+        """Per-class candidate param lists, one file per vulnerability class."""
+        roots = {}
+        for host in self.hosts:
+            roots[host] = self._bucket_dirs(host)
+        buckets = defaultdict(set)
+        for base, param in plan:
+            url, _ = build_request(base, param, sample_value(param), self.cfg)
+            buckets[bucket_of(param)].add(url)
+        allp = set()
+        for bucket, urls in buckets.items():
+            allp |= urls
+            for host, root in roots.items():
+                subset = sorted(u for u in urls if host_of(u).endswith(apex(host)))
+                if subset:
+                    (root / "params" / f"{bucket}.txt").write_text("\n".join(subset))
+        for host, root in roots.items():
+            subset = sorted(u for u in allp if host_of(u).endswith(apex(host)))
+            if subset:
+                (root / "params.txt").write_text("\n".join(subset))
+        return buckets
+
     def write(self):
-        self.outdir.mkdir(parents=True, exist_ok=True)
-        by_vuln = defaultdict(list)
-        for f in self.findings:
-            by_vuln[f.vuln].append(f)
+        for host in self.hosts:
+            root = self._bucket_dirs(host)
+            subset = [f for f in self.findings if host_of(f.url).endswith(apex(host))]
 
-        with (self.outdir / "findings.jsonl").open("w") as fh:
-            for f in self.findings:
-                fh.write(json.dumps(asdict(f)) + "\n")
+            with (root / "findings.jsonl").open("w") as fh:
+                for f in subset:
+                    fh.write(json.dumps(asdict(f)) + "\n")
 
-        for vuln, items in by_vuln.items():
-            with (self.outdir / f"{vuln}.txt").open("w") as fh:
-                for f in sorted(items, key=lambda x: -x.confidence):
-                    fh.write(f"{f.url}\t{f.confidence}\t{f.evidence}\n")
-
-        if self.cfg.csv_out:
-            with (self.outdir / "findings.csv").open("w", newline="") as fh:
-                w = csv.writer(fh)
-                w.writerow(["severity", "confidence", "vuln", "url", "param", "evidence", "status", "ts"])
-                for f in sorted(self.findings, key=lambda x: (SEV_ORDER[x.severity], -x.confidence)):
-                    w.writerow([f.severity, f.confidence, f.vuln, f.url, f.param,
-                                f.evidence, f.status, f.ts])
-
-        if self.cfg.md_out:
-            with (self.outdir / "report.md").open("w") as fh:
-                fh.write(f"# ParmHunter {VERSION} report\n\n`{now()}`\n\n")
-                fh.write(f"probes: {len(self.seen)} · findings: {len(self.findings)}\n\n")
-                for vuln, items in sorted(by_vuln.items(), key=lambda kv: -len(kv[1])):
-                    fh.write(f"## {vuln} ({len(items)})\n\n")
+            per_class = defaultdict(list)
+            for f in subset:
+                per_class[f.vuln].append(f)
+            for vuln, items in per_class.items():
+                with (root / "findings" / f"{vuln}.txt").open("w") as fh:
                     for f in sorted(items, key=lambda x: -x.confidence):
-                        fh.write(f"- `{f.confidence}%` `{f.severity}` {f.url} — {f.evidence}\n")
-                    fh.write("\n")
+                        fh.write(f"{f.url}\t{f.confidence}\t{f.evidence}\n")
 
-        if self.cfg.html_out:
-            rows = []
-            for f in sorted(self.findings, key=lambda x: (SEV_ORDER[x.severity], -x.confidence)):
-                rows.append(
-                    f"<tr class='{f.severity}'><td>{f.severity}</td><td>{f.confidence}%</td>"
-                    f"<td>{html.escape(f.vuln)}</td><td><a href='{html.escape(f.url)}'>"
-                    f"{html.escape(f.url)}</a></td><td>{html.escape(f.param)}</td>"
-                    f"<td>{html.escape(f.evidence)}</td></tr>")
-            (self.outdir / "report.html").write_text(f"""<!doctype html><meta charset=utf-8>
-<title>ParmHunter report</title><style>
+            if self.cfg.csv_out:
+                with (root / "findings.csv").open("w", newline="") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(["severity", "confidence", "vuln", "url", "param",
+                                "evidence", "status", "ts"])
+                    for f in sorted(subset, key=lambda x: (SEV_ORDER[x.severity], -x.confidence)):
+                        w.writerow([f.severity, f.confidence, f.vuln, f.url, f.param,
+                                    f.evidence, f.status, f.ts])
+
+            if self.cfg.md_out:
+                with (root / "report.md").open("w") as fh:
+                    fh.write(f"# ParmHunter {VERSION} — {host}\n\n`{now()}`\n\n")
+                    fh.write(f"findings: {len(subset)}\n\n")
+                    for vuln, items in sorted(per_class.items(), key=lambda kv: -len(kv[1])):
+                        fh.write(f"## {vuln} ({len(items)})\n\n")
+                        for f in sorted(items, key=lambda x: -x.confidence):
+                            fh.write(f"- `{f.confidence}%` `{f.severity}` {f.url} — {f.evidence}\n")
+                        fh.write("\n")
+
+            if self.cfg.html_out:
+                rows = []
+                for f in sorted(subset, key=lambda x: (SEV_ORDER[x.severity], -x.confidence)):
+                    rows.append(
+                        f"<tr class='{f.severity}'><td>{f.severity}</td><td>{f.confidence}%</td>"
+                        f"<td>{html.escape(f.vuln)}</td><td><a href='{html.escape(f.url)}'>"
+                        f"{html.escape(f.url)}</a></td><td>{html.escape(f.param)}</td>"
+                        f"<td>{html.escape(f.evidence)}</td></tr>")
+                (root / "report.html").write_text(f"""<!doctype html><meta charset=utf-8>
+<title>ParmHunter — {html.escape(host)}</title><style>
 body{{font:14px/1.5 ui-monospace,monospace;background:#0f1115;color:#d6dae2;padding:24px}}
 h1{{color:#7ee787}}table{{border-collapse:collapse;width:100%}}
 td,th{{border-bottom:1px solid #262b36;padding:6px 10px;text-align:left;vertical-align:top}}
 th{{color:#8b949e;text-transform:uppercase;font-size:11px;letter-spacing:.08em}}
 a{{color:#79c0ff}}.critical td:first-child{{color:#ff7b72}}.high td:first-child{{color:#ffa657}}
 .medium td:first-child{{color:#e3b341}}.low td:first-child{{color:#8b949e}}
-</style><h1>ParmHunter {VERSION}</h1>
-<p>{now()} · probes {len(self.seen)} · findings {len(self.findings)}</p>
+</style><h1>ParmHunter {VERSION} — {html.escape(host)}</h1>
+<p>{now()} · findings {len(subset)}</p>
 <table><tr><th>sev</th><th>conf</th><th>class</th><th>url</th><th>param</th><th>evidence</th></tr>
 {''.join(rows)}</table>""")
 
+        self.outroot.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text(json.dumps(sorted(f"{b}|{p}" for b, p in self.seen)))
-        C.ok(f"output -> {self.outdir}")
+        C.ok(f"output -> {self.outroot}")
 
     def summary(self):
         print()
@@ -1131,7 +1522,7 @@ a{{color:#79c0ff}}.critical td:first-child{{color:#ff7b72}}.high td:first-child{
         for vuln, n in Counter(f.vuln for f in self.findings).most_common():
             print(f"  {vuln:<15} {n}")
         if self.cfg.stats:
-            print(f"  probes={len(self.seen)} errors={self.counter['errors']} "
+            print(f"  probes={len(self.seen)} req_ok={self.f.ok} req_err={self.f.errors} "
                   f"elapsed={time.time()-self.started:.1f}s")
 
     async def notify(self):
@@ -1163,10 +1554,9 @@ a{{color:#79c0ff}}.critical td:first-child{{color:#ff7b72}}.high td:first-child{
                 C.warn("nothing to probe")
                 return
             if self.cfg.params_only:
-                found = sorted({p for _, p in plan})
-                self.outdir.mkdir(parents=True, exist_ok=True)
-                (self.outdir / "params.txt").write_text("\n".join(found))
-                C.ok(f"{len(found)} params -> {self.outdir/'params.txt'}")
+                buckets = self.write_params(plan)
+                total = sum(len(v) for v in buckets.values())
+                C.ok(f"{total} params across {len(buckets)} class files -> {self.outroot}")
                 return
             await self.run_plan(plan)
             if self.cfg.plan:
@@ -1190,6 +1580,22 @@ def dump_dict():
     print(f"# {sum(len(v) for v in BUILTIN.values())} params", file=sys.stderr)
 
 
+def prompt_targets():
+    print("  enter target(s), one per line — blank line to start")
+    out = []
+    while True:
+        try:
+            line = input("  target > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not line:
+            if out:
+                break
+            continue
+        out.append(line)
+    return out
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser(prog="parmhunter", description=__doc__.split("\n")[1],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1208,19 +1614,31 @@ def parse_args(argv):
 
     n = p.add_argument_group("network")
     n.add_argument("-t", "--threads", type=int, default=40)
-    n.add_argument("--timeout", type=float, default=12.0)
-    n.add_argument("--retries", type=int, default=1)
+    n.add_argument("--limit-per-host", type=int, default=8)
+    n.add_argument("--timeout", type=float, default=15.0)
+    n.add_argument("--archive-timeout", type=float, default=25.0)
+    n.add_argument("--passive-timeout", type=float, default=90.0)
+    n.add_argument("--retries", type=int, default=2)
     n.add_argument("--rate", type=float, default=0.0)
+    n.add_argument("--max-time", type=float, default=0.0)
     n.add_argument("--proxy", default="")
     n.add_argument("-H", "--header", action="append", default=[])
     n.add_argument("-b", "--cookie", default="")
     n.add_argument("-A", "--user-agent", default="")
     n.add_argument("-k", "--insecure", action="store_true")
+    n.add_argument("--aiodns", action="store_true", help="c-ares resolver (needs aiodns)")
+    n.add_argument("--ipv4", action="store_true", help="resolve A records only")
+    n.add_argument("--dns-ttl", type=int, default=DNS_TTL)
     n.add_argument("--method", choices=["GET", "POST"], default="GET")
     n.add_argument("--json-body", action="store_true")
 
     s = p.add_argument_group("scan")
     s.add_argument("--crawl-depth", type=int, default=2)
+    s.add_argument("--katana-depth", type=int, default=3)
+    s.add_argument("--tool-timeout", type=float, default=180.0)
+    s.add_argument("--no-external", dest="external", action="store_false",
+                   help="disable katana/waybackurls/gau")
+    s.add_argument("--no-install-tools", dest="install_tools", action="store_false")
     s.add_argument("--max-urls", type=int, default=200)
     s.add_argument("--max-params", type=int, default=45)
     s.add_argument("--max-size", type=int, default=MAX_BODY)
@@ -1239,6 +1657,7 @@ def parse_args(argv):
     s.add_argument("--cache", action="store_true")
     s.add_argument("--no-waf-detect", dest="waf_detect", action="store_false")
     s.add_argument("--plan", action="store_true")
+    s.add_argument("--fast", action="store_true", help="preset for speed over depth")
     s.add_argument("--db", default="parmhunter.kb.sqlite")
     s.add_argument("--no-learn", action="store_true")
 
@@ -1258,19 +1677,31 @@ def parse_args(argv):
     if a.dump_dict:
         dump_dict()
         sys.exit(0)
-    if not (a.url or a.listfile or a.domain or a.use_stdin):
-        p.error("need -u, -l, -d or --stdin")
+
+    if a.fast:
+        a.threads = max(a.threads, 80)
+        a.max_params = min(a.max_params, 25)
+        a.min_confidence = max(a.min_confidence, 65)
+        a.crawl_depth = min(a.crawl_depth, 1)
+        a.katana_depth = min(a.katana_depth, 2)
+        a.timeout = min(a.timeout, 10.0)
+        a.archive_timeout = min(a.archive_timeout, 15.0)
 
     cfg = Config(
         urls=a.url, listfile=a.listfile or "", use_stdin=a.use_stdin,
         domain=a.domain or "", seeds=[x.strip() for x in a.seeds.split(",") if x.strip()],
         wordlists=a.wordlist, wordlist_dir=a.wordlist_dir or "",
-        only_wordlist=a.only_wordlist, threads=a.threads, timeout=a.timeout,
-        retries=a.retries, rate=a.rate, proxy=a.proxy, cookie=a.cookie,
-        user_agent=a.user_agent, insecure=a.insecure, method=a.method,
-        json_body=a.json_body, outdir=a.outdir, csv_out=a.csv_out, md_out=a.md_out,
-        html_out=a.html_out, jsonl=a.jsonl, silent=a.silent or a.jsonl,
-        no_banner=a.no_banner, crawl_depth=a.crawl_depth, max_urls=a.max_urls,
+        only_wordlist=a.only_wordlist, threads=a.threads,
+        limit_per_host=a.limit_per_host, aiodns=a.aiodns, ipv4=a.ipv4,
+        dns_ttl=a.dns_ttl, timeout=a.timeout, archive_timeout=a.archive_timeout,
+        passive_timeout=a.passive_timeout, retries=a.retries, rate=a.rate,
+        max_time=a.max_time, proxy=a.proxy, cookie=a.cookie, user_agent=a.user_agent,
+        insecure=a.insecure, method=a.method, json_body=a.json_body,
+        outdir=a.outdir, csv_out=a.csv_out, md_out=a.md_out, html_out=a.html_out,
+        jsonl=a.jsonl, silent=a.silent or a.jsonl, no_banner=a.no_banner,
+        crawl_depth=a.crawl_depth, katana_depth=a.katana_depth,
+        tool_timeout=a.tool_timeout, external=a.external,
+        install_tools=a.install_tools, max_urls=a.max_urls,
         max_params=a.max_params, max_size=a.max_size, passive_only=a.passive_only,
         active_only=a.active_only, params_only=a.params_only, collab=a.collab,
         db=a.db, min_confidence=a.min_confidence, min_severity=a.min_severity,
@@ -1289,14 +1720,36 @@ def parse_args(argv):
     return cfg
 
 
+async def amain(cfg):
+    if cfg.max_time > 0:
+        try:
+            await asyncio.wait_for(Hunter(cfg).run(), timeout=cfg.max_time)
+        except asyncio.TimeoutError:
+            C.warn(f"max-time {cfg.max_time:.0f}s reached")
+    else:
+        await Hunter(cfg).run()
+
+
 def main(argv=None):
     cfg = parse_args(argv or sys.argv[1:])
     if not cfg.silent and not cfg.no_banner:
         banner(cfg)
+    if not (cfg.urls or cfg.listfile or cfg.domain or cfg.use_stdin):
+        if not sys.stdin.isatty():
+            cfg.urls = [l.strip() for l in sys.stdin if l.strip()]
+        else:
+            cfg.urls = prompt_targets()
+        if not cfg.urls:
+            C.err("no targets given")
+            return 2
+        if not cfg.silent and not cfg.no_banner:
+            C.info(f"{len(cfg.urls)} target(s) queued")
     if not HAVE_AIOHTTP:
         C.warn("aiohttp missing — slow urllib fallback (pip install aiohttp)")
+    if cfg.external:
+        ensure_tools(cfg)
     try:
-        asyncio.run(Hunter(cfg).run())
+        asyncio.run(amain(cfg))
     except KeyboardInterrupt:
         C.warn("interrupted")
         return 130
